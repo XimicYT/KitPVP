@@ -20,7 +20,6 @@ const KITS = {
     tank:    { name: "Tank",    hp: 200, maxHp: 200, speed: 3.5,size: 30, reload: 25, dmg: 18, bulletSpeed: 10, range: 350,  spread: 0.05 },
     shotgun: { name: "Shotgun", hp: 120, maxHp: 120, speed: 5, size: 24, reload: 40, dmg: 8,  bulletSpeed: 12, range: 300,  spread: 0.2, count: 5 },
     bouncy:  { name: "Bouncy Boi", hp: 150, maxHp: 150, speed: 0.8, size: 25, reload: 9999, dmg: 0, bulletSpeed: 0, range: 0, spread: 0 },
-    // NEW CLASS
     gravity: { name: "Gravity Guy", hp: 250, maxHp: 250, speed: 3.0, size: 35, reload: 9999, dmg: 2, bulletSpeed: 0, range: 450, spread: 0 }
 };
 
@@ -105,12 +104,34 @@ function scheduleOrbSpawn() {
 }
 for(let i=0; i<ORB_COUNT; i++) orbs.push({ ...getSafeOrbLocation(), id: i });
 
+// --- UPDATED SPAWN LOGIC (AVOIDS GRAVITY WELLS) ---
 function getSafeSpawn(radius) {
     let attempts = 0;
     while (attempts < 50) {
         const x = Math.random() * MAP_SIZE;
         const y = Math.random() * MAP_SIZE;
-        if (!isColliding({x, y}, radius + 50)) return { x, y };
+        let valid = true;
+
+        // 1. Check Map Boundaries & Obstacles
+        if (isColliding({x, y}, radius + 50)) valid = false;
+
+        // 2. Check for Gravity Guys (Don't spawn inside a black hole)
+        if (valid) {
+            for (const id in players) {
+                const p = players[id];
+                if (p.kit === 'gravity') {
+                    const dx = p.x - x;
+                    const dy = p.y - y;
+                    // Ensure we spawn at least 'range' + buffer away
+                    if (Math.sqrt(dx*dx + dy*dy) < KITS.gravity.range + 100) {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (valid) return { x, y };
         attempts++;
     }
     return { x: MAP_SIZE/2, y: MAP_SIZE/2 };
@@ -138,7 +159,7 @@ io.on('connection', (socket) => {
             id: socket.id,
             name: data.name,
             x: spawn.x, y: spawn.y,
-            vx: 0, vy: 0, // Velocity for Bouncy Boi
+            vx: 0, vy: 0,
             kit: kitKey,
             hp: kit.hp, maxHp: kit.maxHp,
             score: 0,
@@ -153,7 +174,6 @@ io.on('connection', (socket) => {
 
     socket.on('shoot', () => {
         const p = players[socket.id];
-        // Bouncy Boi cannot shoot
         if (p && p.kit !== 'bouncy' && p.cooldown <= 0) {
             const stats = KITS[p.kit];
             const count = stats.count || 1;
@@ -197,8 +217,7 @@ setInterval(() => {
 
     const now = Date.now();
 
-    // 1. GRAVITY PRE-CALCULATION
-    // We check if there are any Gravity Guys and apply forces before movement
+    // 1. UPDATED GRAVITY LOGIC
     for (const id in players) {
         const p = players[id];
         if (p.kit === 'gravity') {
@@ -215,27 +234,52 @@ setInterval(() => {
                 const dist = Math.sqrt(dx*dx + dy*dy);
 
                 if (dist < range) {
-                    // The closer you are, the stronger the pull
-                    const force = 3.5; 
+                    // INVERSE DISTANCE SCALING
+                    // Closer = Stronger. 
+                    // At edge (dist = range): factor is 0.
+                    // At center (dist = 0): factor is 1.
+                    const pullFactor = 1 - (dist / range);
+                    
+                    // Base force (weak at edge, strong at center)
+                    // Edge: 0.5, Center: 8.0
+                    let force = 0.5 + (pullFactor * 7.5);
+                    
+                    // GRAVITY VS GRAVITY (The Singularity)
+                    if (target.kit === 'gravity') {
+                        force *= 2.0; // They pull each other faster
+                    }
+
                     const angle = Math.atan2(dy, dx);
                     
-                    // Apply Suction
                     if (target.kit === 'bouncy') {
-                        target.vx += Math.cos(angle) * 0.5; // Affects momentum
-                        target.vy += Math.sin(angle) * 0.5;
+                        target.vx += Math.cos(angle) * (force * 0.2);
+                        target.vy += Math.sin(angle) * (force * 0.2);
                     } else {
-                        target.x += Math.cos(angle) * force; // Drags normal players
+                        target.x += Math.cos(angle) * force;
                         target.y += Math.sin(angle) * force;
                     }
 
-                    // Contact Damage (Buzzsaw)
-                    if (dist < (KITS.gravity.size + KITS[target.kit].size)) {
-                        target.hp -= KITS.gravity.dmg; // Ticks every frame (very fast damage)
+                    // CONTACT DAMAGE
+                    const hitDist = KITS.gravity.size + KITS[target.kit].size;
+                    
+                    if (dist < hitDist) {
+                        let damage = KITS.gravity.dmg;
+                        
+                        // GRAVITY VS GRAVITY: SINGULARITY DAMAGE
+                        if (target.kit === 'gravity') {
+                            damage = 5; // Rapid tick damage (Mutual Destruction)
+                            // Also damage the source (p) because their fields are collapsing
+                            p.hp -= 2; 
+                            p.regenTimer = 300;
+                        }
+
+                        target.hp -= damage;
                         target.regenTimer = 300;
+
                         if (target.hp <= 0) {
                             io.emit('kill_feed', { killer: p.name, victim: target.name });
                             io.to(target.id).emit('you_died', { killer: p.name });
-                            p.score += 100;
+                            p.score += (target.kit === 'gravity' ? 200 : 100); // Bonus for killing another gravity
                             p.hp = Math.min(p.maxHp, p.hp + 50);
                             delete players[targetId];
                         }
@@ -243,18 +287,20 @@ setInterval(() => {
                 }
             }
 
-            // Pull Bullets
+            // Pull Bullets (Also scaled by distance)
             for (const b of bullets) {
-                if (b.ownerId === p.id) continue; // Don't suck own bullets (if he had them)
+                if (b.ownerId === p.id) continue;
                 const dx = p.x - b.x;
                 const dy = p.y - b.y;
                 const dist = Math.sqrt(dx*dx + dy*dy);
                 
                 if (dist < range) {
-                    // Curving bullets
+                    const pullFactor = 1 - (dist / range);
                     const angle = Math.atan2(dy, dx);
-                    b.vx += Math.cos(angle) * 0.8;
-                    b.vy += Math.sin(angle) * 0.8;
+                    // Bullets get sucked in harder the closer they are
+                    const strength = 0.5 + (pullFactor * 1.5); 
+                    b.vx += Math.cos(angle) * strength;
+                    b.vy += Math.sin(angle) * strength;
                 }
             }
         }
@@ -263,14 +309,22 @@ setInterval(() => {
     // 2. STANDARD MOVEMENT LOOP
     for (const id in players) {
         const p = players[id];
-        if(!p) continue; // Player might have died in gravity loop
+        if(!p) continue; 
         const stats = KITS[p.kit];
         
         p.isInvincible = now < p.invincibleUntil;
 
-        // Regen
         if (p.hp < p.maxHp && p.regenTimer <= 0) p.hp = Math.min(p.maxHp, p.hp + 0.15);
         if (p.regenTimer > 0) p.regenTimer--;
+        
+        // --- Gravity Guy Self-Damage Check ---
+        // If they died from Singularity interaction in the previous loop
+        if (p.hp <= 0 && p.kit === 'gravity') {
+             io.emit('kill_feed', { killer: "The Singularity", victim: p.name });
+             io.to(p.id).emit('you_died', { killer: "The Singularity" });
+             delete players[id];
+             continue;
+        }
 
         // Movement Logic
         if (p.kit === 'bouncy') {
@@ -294,7 +348,7 @@ setInterval(() => {
             p.y += p.vy;
             if (isColliding(p, stats.size)) { p.y -= p.vy; p.vy = -p.vy * 0.9; }
 
-            // Bouncy Ramming Logic
+            // Bouncy Ramming
             const speedMag = Math.sqrt(p.vx*p.vx + p.vy*p.vy);
             if (speedMag > 10) {
                 for (const targetId in players) {
@@ -327,10 +381,8 @@ setInterval(() => {
             if (p.input.shift && p.stamina > 0) {
                 speed *= 1.4;
                 p.stamina = Math.max(0, p.stamina - 1.2);
-                p.isSprinting = true;
             } else {
                 p.stamina = Math.min(100, p.stamina + 0.6);
-                p.isSprinting = false;
             }
 
             let dx = 0, dy = 0;
