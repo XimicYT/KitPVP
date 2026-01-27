@@ -19,9 +19,9 @@ const KITS = {
     sniper:  { name: "Sniper",  hp: 60,  maxHp: 60,  speed: 6, size: 20, reload: 50, dmg: 40, bulletSpeed: 28, range: 1000, spread: 0.01 },
     tank:    { name: "Tank",    hp: 200, maxHp: 200, speed: 3.5,size: 30, reload: 25, dmg: 18, bulletSpeed: 10, range: 350,  spread: 0.05 },
     shotgun: { name: "Shotgun", hp: 120, maxHp: 120, speed: 5, size: 24, reload: 40, dmg: 8,  bulletSpeed: 12, range: 300,  spread: 0.2, count: 5 },
-    // THE HIDDEN CLASS
-    bouncy:  { name: "Bouncy Boi", hp: 150, maxHp: 150, speed: 0.8, size: 25, reload: 9999, dmg: 0, bulletSpeed: 0, range: 0, spread: 0 } 
-    // Note: speed here acts as 'acceleration' for bouncy class
+    bouncy:  { name: "Bouncy Boi", hp: 150, maxHp: 150, speed: 0.8, size: 25, reload: 9999, dmg: 0, bulletSpeed: 0, range: 0, spread: 0 },
+    // NEW CLASS
+    gravity: { name: "Gravity Guy", hp: 250, maxHp: 250, speed: 3.0, size: 35, reload: 9999, dmg: 2, bulletSpeed: 0, range: 450, spread: 0 }
 };
 
 let players = {};
@@ -197,87 +197,123 @@ setInterval(() => {
 
     const now = Date.now();
 
+    // 1. GRAVITY PRE-CALCULATION
+    // We check if there are any Gravity Guys and apply forces before movement
     for (const id in players) {
         const p = players[id];
+        if (p.kit === 'gravity') {
+            const range = KITS.gravity.range;
+            
+            // Pull Players
+            for (const targetId in players) {
+                if (id === targetId) continue;
+                const target = players[targetId];
+                if (target.isInvincible) continue;
+
+                const dx = p.x - target.x;
+                const dy = p.y - target.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+
+                if (dist < range) {
+                    // The closer you are, the stronger the pull
+                    const force = 3.5; 
+                    const angle = Math.atan2(dy, dx);
+                    
+                    // Apply Suction
+                    if (target.kit === 'bouncy') {
+                        target.vx += Math.cos(angle) * 0.5; // Affects momentum
+                        target.vy += Math.sin(angle) * 0.5;
+                    } else {
+                        target.x += Math.cos(angle) * force; // Drags normal players
+                        target.y += Math.sin(angle) * force;
+                    }
+
+                    // Contact Damage (Buzzsaw)
+                    if (dist < (KITS.gravity.size + KITS[target.kit].size)) {
+                        target.hp -= KITS.gravity.dmg; // Ticks every frame (very fast damage)
+                        target.regenTimer = 300;
+                        if (target.hp <= 0) {
+                            io.emit('kill_feed', { killer: p.name, victim: target.name });
+                            io.to(target.id).emit('you_died', { killer: p.name });
+                            p.score += 100;
+                            p.hp = Math.min(p.maxHp, p.hp + 50);
+                            delete players[targetId];
+                        }
+                    }
+                }
+            }
+
+            // Pull Bullets
+            for (const b of bullets) {
+                if (b.ownerId === p.id) continue; // Don't suck own bullets (if he had them)
+                const dx = p.x - b.x;
+                const dy = p.y - b.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                
+                if (dist < range) {
+                    // Curving bullets
+                    const angle = Math.atan2(dy, dx);
+                    b.vx += Math.cos(angle) * 0.8;
+                    b.vy += Math.sin(angle) * 0.8;
+                }
+            }
+        }
+    }
+
+    // 2. STANDARD MOVEMENT LOOP
+    for (const id in players) {
+        const p = players[id];
+        if(!p) continue; // Player might have died in gravity loop
         const stats = KITS[p.kit];
+        
         p.isInvincible = now < p.invincibleUntil;
 
         // Regen
         if (p.hp < p.maxHp && p.regenTimer <= 0) p.hp = Math.min(p.maxHp, p.hp + 0.15);
         if (p.regenTimer > 0) p.regenTimer--;
 
-        // --- MOVEMENT LOGIC ---
+        // Movement Logic
         if (p.kit === 'bouncy') {
-            // === BOUNCY BOI PHYSICS ===
-            
-            // 1. Acceleration (Slippery movement)
-            const accel = stats.speed; // 0.8
+            const accel = stats.speed;
             if (p.input.w) p.vy -= accel;
             if (p.input.s) p.vy += accel;
             if (p.input.a) p.vx -= accel;
             if (p.input.d) p.vx += accel;
 
-            // 2. Cap Max Speed
-            const maxSpeed = 22; // Very fast
+            const maxSpeed = 22;
             const currentSpeed = Math.sqrt(p.vx*p.vx + p.vy*p.vy);
             if (currentSpeed > maxSpeed) {
                 const ratio = maxSpeed / currentSpeed;
                 p.vx *= ratio;
                 p.vy *= ratio;
             }
+            p.vx *= 0.985; p.vy *= 0.985;
 
-            // 3. Friction (Very low = Drift)
-            p.vx *= 0.985;
-            p.vy *= 0.985;
-
-            // 4. Apply X & Bounce
             p.x += p.vx;
-            if (isColliding(p, stats.size)) {
-                p.x -= p.vx; // Back out
-                p.vx = -p.vx * 0.9; // Bounce with 90% energy retention
-            }
-
-            // 5. Apply Y & Bounce
+            if (isColliding(p, stats.size)) { p.x -= p.vx; p.vx = -p.vx * 0.9; }
             p.y += p.vy;
-            if (isColliding(p, stats.size)) {
-                p.y -= p.vy; // Back out
-                p.vy = -p.vy * 0.9; // Bounce with 90% energy retention
-            }
+            if (isColliding(p, stats.size)) { p.y -= p.vy; p.vy = -p.vy * 0.9; }
 
-            // 6. RAMMING DAMAGE
+            // Bouncy Ramming Logic
             const speedMag = Math.sqrt(p.vx*p.vx + p.vy*p.vy);
-            if (speedMag > 10) { // Only damage if moving fast
+            if (speedMag > 10) {
                 for (const targetId in players) {
                     if (id === targetId) continue;
                     const target = players[targetId];
                     if (target.isInvincible) continue;
-
                     const dx = target.x - p.x;
                     const dy = target.y - p.y;
-                    const dist = Math.sqrt(dx*dx + dy*dy);
-                    const combinedSize = stats.size + KITS[target.kit].size;
-
-                    if (dist < combinedSize) {
-                        // HIT!
-                        const dmg = Math.floor(speedMag * 2.5); // Speed 20 = 50 damage
+                    if (Math.sqrt(dx*dx + dy*dy) < stats.size + KITS[target.kit].size) {
+                        const dmg = Math.floor(speedMag * 2.5);
                         target.hp -= dmg;
                         target.regenTimer = 300;
                         io.emit('hit', { x: target.x, y: target.y });
+                        p.vx = -p.vx * 0.5; p.vy = -p.vy * 0.5; // Bounce
                         
-                        // Bounce off the victim
-                        p.vx = -p.vx * 0.5;
-                        p.vy = -p.vy * 0.5;
-                        
-                        // Knockback the victim
-                        if (target.kit === 'bouncy') {
-                            target.vx += p.vx * 0.5;
-                            target.vy += p.vy * 0.5;
-                        }
-
                         if (target.hp <= 0) {
                             io.emit('kill_feed', { killer: p.name, victim: target.name });
                             io.to(target.id).emit('you_died', { killer: p.name });
-                            p.score += 150; // Bonus for ram kill
+                            p.score += 150;
                             p.hp = Math.min(p.maxHp, p.hp + 50);
                             delete players[targetId];
                         }
@@ -286,7 +322,7 @@ setInterval(() => {
             }
 
         } else {
-            // === STANDARD PHYSICS (Tight, Walls Sliding) ===
+            // Standard Movement
             let speed = stats.speed;
             if (p.input.shift && p.stamina > 0) {
                 speed *= 1.4;
@@ -303,24 +339,15 @@ setInterval(() => {
             if (p.input.a) dx -= speed;
             if (p.input.d) dx += speed;
 
-            if (dx !== 0 && dy !== 0) {
-                const factor = 1 / Math.sqrt(2);
-                dx *= factor; dy *= factor;
-            }
+            if (dx !== 0 && dy !== 0) { const factor = 1 / Math.sqrt(2); dx *= factor; dy *= factor; }
 
-            if (dx !== 0) {
-                p.x += dx;
-                if (isColliding(p, stats.size)) p.x -= dx;
-            }
-            if (dy !== 0) {
-                p.y += dy;
-                if (isColliding(p, stats.size)) p.y -= dy;
-            }
+            if (dx !== 0) { p.x += dx; if (isColliding(p, stats.size)) p.x -= dx; }
+            if (dy !== 0) { p.y += dy; if (isColliding(p, stats.size)) p.y -= dy; }
         }
         
         if (p.cooldown > 0) p.cooldown--;
 
-        // Orbs
+        // Orb Collision
         for (let i = orbs.length - 1; i >= 0; i--) {
             const orb = orbs[i];
             const dx = p.x - orb.x;
@@ -334,7 +361,7 @@ setInterval(() => {
         }
     }
 
-    // Bullets
+    // 3. BULLET LOOP
     for (let i = bullets.length - 1; i >= 0; i--) {
         const b = bullets[i];
         b.x += b.vx;
