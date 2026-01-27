@@ -8,12 +8,13 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 app.use(express.static("public"));
 
-// --- CONFIG (CLASSIC TIGHT MAP) ---
+// --- CONFIG ---
 const FPS = 60;
-const MAP_SIZE = 1600; // Much smaller for instant action
-const OBSTACLE_COUNT = 30; // Dense obstacles
-const ORB_COUNT = 50; // Lots of XP everywhere
+const MAP_SIZE = 1600;
+const OBSTACLE_COUNT = 30;
+const ORB_COUNT = 50;
 
+// Kits (lowercase keys for consistency)
 const KITS = {
   assault: {
     name: "Assault",
@@ -25,7 +26,6 @@ const KITS = {
     dmg: 8,
     bulletSpeed: 14,
     range: 450,
-    color: "#3498db",
     spread: 0.1,
   },
   sniper: {
@@ -38,7 +38,6 @@ const KITS = {
     dmg: 40,
     bulletSpeed: 28,
     range: 1000,
-    color: "#e74c3c",
     spread: 0.01,
   },
   tank: {
@@ -51,7 +50,6 @@ const KITS = {
     dmg: 18,
     bulletSpeed: 10,
     range: 350,
-    color: "#27ae60",
     spread: 0.05,
   },
   shotgun: {
@@ -64,7 +62,6 @@ const KITS = {
     dmg: 8,
     bulletSpeed: 12,
     range: 300,
-    color: "#9b59b6",
     spread: 0.2,
     count: 5,
   },
@@ -122,13 +119,28 @@ function getSafeOrbLocation() {
     const y = Math.random() * MAP_SIZE;
     const r = 8 + Math.random() * 4;
     let valid = true;
-    for (const obs of obstacles) {
-      if (checkRectCollision({ x, y, r: r + 5 }, obs)) valid = false;
+
+    // 1. Check Border (50px padding from edge)
+    if (x < 50 || x > MAP_SIZE - 50 || y < 50 || y > MAP_SIZE - 50)
+      valid = false;
+
+    // 2. Check Obstacles
+    if (valid) {
+      for (const obs of obstacles) {
+        // Add extra buffer so it doesn't touch the wall
+        if (checkRectCollision({ x, y, r: r + 15 }, obs)) valid = false;
+      }
     }
-    if (valid) return { x, y, r }; // Removed view distance check for classic chaos
+
+    if (valid) return { x, y, r };
     attempts++;
   }
-  return { x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE, r: 10 };
+  // Fallback: Center safe zone
+  return {
+    x: MAP_SIZE / 2 + (Math.random() - 0.5) * 100,
+    y: MAP_SIZE / 2 + (Math.random() - 0.5) * 100,
+    r: 10,
+  };
 }
 
 function scheduleOrbSpawn() {
@@ -152,6 +164,11 @@ function getSafeSpawn(radius) {
     const x = Math.random() * MAP_SIZE;
     const y = Math.random() * MAP_SIZE;
     let safe = true;
+
+    // Border check
+    if (x < 50 || x > MAP_SIZE - 50 || y < 50 || y > MAP_SIZE - 50)
+      safe = false;
+
     for (const obs of obstacles) {
       if (checkRectCollision({ x, y, r: radius + 20 }, obs)) safe = false;
     }
@@ -163,7 +180,13 @@ function getSafeSpawn(radius) {
 
 // --- SOCKETS ---
 io.on("connection", (socket) => {
+  // Send map data immediately
   socket.emit("mapData", { obstacles });
+
+  // Ping / Latency check
+  socket.on("latency", (callback) => {
+    callback(); // Simply respond to acknowledge
+  });
 
   socket.on("check_name", (name) => {
     let taken = false;
@@ -174,14 +197,16 @@ io.on("connection", (socket) => {
   });
 
   socket.on("join_game", (data) => {
-    const kit = KITS[data.kit] || KITS.assault;
+    const kitKey = data.kit || "assault";
+    const kit = KITS[kitKey] || KITS.assault;
     const spawn = getSafeSpawn(kit.size);
+
     players[socket.id] = {
       id: socket.id,
       name: data.name,
       x: spawn.x,
       y: spawn.y,
-      kit: data.kit,
+      kit: kitKey, // Store the key (e.g., 'sniper')
       hp: kit.hp,
       maxHp: kit.maxHp,
       score: 0,
@@ -232,13 +257,11 @@ io.on("connection", (socket) => {
 });
 
 setInterval(() => {
-  // Leaderboard
   const leaderboard = Object.values(players)
     .sort((a, b) => b.score - a.score)
     .slice(0, 5)
     .map((p) => ({ name: p.name, score: p.score }));
 
-  // Players
   for (const id in players) {
     const p = players[id];
     const stats = KITS[p.kit];
@@ -270,6 +293,12 @@ setInterval(() => {
         const original = p[m.axis];
         p[m.axis] += m.val;
         let collided = false;
+
+        // Map Boundaries
+        if (p.x < 0 || p.x > MAP_SIZE || p.y < 0 || p.y > MAP_SIZE)
+          collided = true;
+
+        // Obstacles
         for (const obs of obstacles) {
           if (checkRectCollision({ x: p.x, y: p.y, r: stats.size }, obs)) {
             collided = true;
@@ -298,7 +327,6 @@ setInterval(() => {
     }
   }
 
-  // Bullets
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
     b.x += b.vx;
