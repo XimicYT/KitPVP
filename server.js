@@ -4,12 +4,11 @@ const http = require('http');
 const server = http.createServer(app);
 const { Server } = require("socket.io");
 
-// ALLOW CORS (So you can host on Netlify later if you want)
 const io = new Server(server, {
     cors: {
-        origin: "*",            // Allow connection from ANYWHERE (including file://)
+        origin: "*",
         methods: ["GET", "POST"],
-        credentials: false      // Must be false if origin is "*"
+        credentials: false
     }
 });
 
@@ -20,9 +19,9 @@ const FPS = 60;
 const MAP_SIZE = 2000;
 
 const KITS = {
-    assault: { name: "Assault", hp: 100, speed: 5, size: 20, reload: 15, dmg: 10, bulletSpeed: 12, range: 400 },
-    sniper:  { name: "Sniper",  hp: 60,  speed: 6, size: 18, reload: 60, dmg: 45, bulletSpeed: 25, range: 800 },
-    tank:    { name: "Tank",    hp: 200, speed: 3, size: 28, reload: 30, dmg: 20, bulletSpeed: 8,  range: 300 }
+    assault: { name: "Assault", hp: 100, speed: 5, size: 20, reload: 15, dmg: 10, bulletSpeed: 12, range: 400, color: '#3498db' },
+    sniper:  { name: "Sniper",  hp: 60,  speed: 6, size: 18, reload: 60, dmg: 45, bulletSpeed: 25, range: 800, color: '#e74c3c' },
+    tank:    { name: "Tank",    hp: 200, speed: 3, size: 28, reload: 30, dmg: 20, bulletSpeed: 8,  range: 300, color: '#27ae60' }
 };
 
 let players = {};
@@ -30,7 +29,6 @@ let bullets = [];
 let bulletIdCounter = 0;
 
 io.on('connection', (socket) => {
-    // 1. Send total count to everyone when a new person connects
     io.emit('playerCount', io.engine.clientsCount);
 
     socket.on('join_game', (kitName) => {
@@ -45,7 +43,10 @@ io.on('connection', (socket) => {
             score: 0,
             angle: 0,
             cooldown: 0,
-            input: { w: false, a: false, s: false, d: false }
+            // SPRINT MECHANIC:
+            stamina: 100, 
+            isSprinting: false,
+            input: { w: false, a: false, s: false, d: false, shift: false }
         };
     });
 
@@ -77,22 +78,31 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         delete players[socket.id];
-        // 2. Update count when someone leaves
         io.emit('playerCount', io.engine.clientsCount);
     });
 });
 
-// Game Loop
 setInterval(() => {
-    // Player Logic
     for (const id in players) {
         const p = players[id];
         const stats = KITS[p.kit];
+        
+        // Sprint Logic
+        let currentSpeed = stats.speed;
+        if (p.input.shift && p.stamina > 0) {
+            currentSpeed *= 1.5; // 50% speed boost
+            p.stamina = Math.max(0, p.stamina - 2);
+            p.isSprinting = true;
+        } else {
+            p.stamina = Math.min(100, p.stamina + 1);
+            p.isSprinting = false;
+        }
 
-        if (p.input.w) p.y -= stats.speed;
-        if (p.input.s) p.y += stats.speed;
-        if (p.input.a) p.x -= stats.speed;
-        if (p.input.d) p.x += stats.speed;
+        // Movement
+        if (p.input.w) p.y -= currentSpeed;
+        if (p.input.s) p.y += currentSpeed;
+        if (p.input.a) p.x -= currentSpeed;
+        if (p.input.d) p.x += currentSpeed;
 
         p.x = Math.max(0, Math.min(MAP_SIZE, p.x));
         p.y = Math.max(0, Math.min(MAP_SIZE, p.y));
@@ -100,7 +110,7 @@ setInterval(() => {
         if (p.cooldown > 0) p.cooldown--;
     }
 
-    // Bullet Logic
+    // Bullet Logic (Same as before)
     for (let i = bullets.length - 1; i >= 0; i--) {
         const b = bullets[i];
         b.x += b.vx;
@@ -127,6 +137,7 @@ setInterval(() => {
                         p.hp = p.maxHp;
                         p.x = Math.random() * MAP_SIZE;
                         p.y = Math.random() * MAP_SIZE;
+                        p.stamina = 100;
                     }
                     break;
                 }
