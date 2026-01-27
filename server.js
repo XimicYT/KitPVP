@@ -11,10 +11,9 @@ app.use(express.static("public"));
 // --- CONFIG ---
 const FPS = 60;
 const MAP_SIZE = 1600;
-const OBSTACLE_COUNT = 15; // Reduced for more open space
-const ORB_COUNT = 30; // Reduced clutter
+const OBSTACLE_COUNT = 12;
+const ORB_COUNT = 25;
 
-// Kits
 const KITS = {
   assault: {
     name: "Assault",
@@ -73,19 +72,13 @@ let obstacles = [];
 let orbs = [];
 let bulletIdCounter = 0;
 
-// --- PHYSICS ENGINE ---
+// --- PHYSICS UTILS ---
 function checkRectCollision(circle, rect) {
-  // Find the closest point to the circle within the rectangle
-  const closestX = Math.max(rect.x, Math.min(circle.x, rect.x + rect.w));
-  const closestY = Math.max(rect.y, Math.min(circle.y, rect.y + rect.h));
-
-  // Calculate the distance between the circle's center and this closest point
-  const distanceX = circle.x - closestX;
-  const distanceY = circle.y - closestY;
-
-  // If the distance is less than the circle's radius, an intersection occurs
-  const distanceSquared = distanceX * distanceX + distanceY * distanceY;
-  return distanceSquared < circle.r * circle.r;
+  const testX = Math.max(rect.x, Math.min(circle.x, rect.x + rect.w));
+  const testY = Math.max(rect.y, Math.min(circle.y, rect.y + rect.h));
+  const distX = circle.x - testX;
+  const distY = circle.y - testY;
+  return distX * distX + distY * distY < circle.r * circle.r;
 }
 
 function checkRectOverlap(r1, r2, padding = 0) {
@@ -97,20 +90,28 @@ function checkRectOverlap(r1, r2, padding = 0) {
   );
 }
 
+function isColliding(p, r) {
+  if (p.x < 0 || p.x > MAP_SIZE || p.y < 0 || p.y > MAP_SIZE) return true;
+  for (const obs of obstacles) {
+    if (checkRectCollision({ x: p.x, y: p.y, r: r }, obs)) return true;
+  }
+  return false;
+}
+
 // --- GENERATION ---
 function generateObstacles() {
   obstacles = [];
   let attempts = 0;
   while (obstacles.length < OBSTACLE_COUNT && attempts < 1000) {
-    const w = 80 + Math.random() * 120; // Slightly larger obstacles
-    const h = 80 + Math.random() * 120;
+    const w = 100 + Math.random() * 150;
+    const h = 100 + Math.random() * 150;
     const x = Math.random() * (MAP_SIZE - w);
     const y = Math.random() * (MAP_SIZE - h);
     const newObs = { x, y, w, h };
 
     let valid = true;
     for (const obs of obstacles) {
-      if (checkRectOverlap(newObs, obs, 100)) valid = false; // More space between obstacles
+      if (checkRectOverlap(newObs, obs, 100)) valid = false;
     }
     if (valid) obstacles.push(newObs);
     attempts++;
@@ -123,14 +124,13 @@ function getSafeOrbLocation() {
   while (attempts < 50) {
     const x = Math.random() * MAP_SIZE;
     const y = Math.random() * MAP_SIZE;
-    const r = 10; // Fixed Orb Size
+    const r = 8 + Math.random() * 4;
     let valid = true;
-
     if (x < 50 || x > MAP_SIZE - 50 || y < 50 || y > MAP_SIZE - 50)
       valid = false;
     if (valid) {
       for (const obs of obstacles) {
-        if (checkRectCollision({ x, y, r: r + 20 }, obs)) valid = false;
+        if (checkRectCollision({ x, y, r: r + 30 }, obs)) valid = false;
       }
     }
     if (valid) return { x, y, r };
@@ -159,13 +159,7 @@ function getSafeSpawn(radius) {
   while (attempts < 50) {
     const x = Math.random() * MAP_SIZE;
     const y = Math.random() * MAP_SIZE;
-    let safe = true;
-    if (x < 50 || x > MAP_SIZE - 50 || y < 50 || y > MAP_SIZE - 50)
-      safe = false;
-    for (const obs of obstacles) {
-      if (checkRectCollision({ x, y, r: radius + 20 }, obs)) safe = false;
-    }
-    if (safe) return { x, y };
+    if (!isColliding({ x, y }, radius + 50)) return { x, y };
     attempts++;
   }
   return { x: MAP_SIZE / 2, y: MAP_SIZE / 2 };
@@ -203,7 +197,8 @@ io.on("connection", (socket) => {
       cooldown: 0,
       stamina: 100,
       regenTimer: 0,
-      invincible: 180,
+      // TIME BASED INVINCIBILITY (2.5 Seconds)
+      invincibleUntil: Date.now() + 2500,
       input: { w: false, a: false, s: false, d: false, shift: false },
     };
   });
@@ -229,7 +224,10 @@ io.on("connection", (socket) => {
         });
       }
       p.cooldown = stats.reload;
+      // Interrupt Regen on shoot
       p.regenTimer = 180;
+      // Remove invincibility if you shoot
+      p.invincibleUntil = 0;
     }
   });
 
@@ -252,17 +250,22 @@ setInterval(() => {
     .slice(0, 5)
     .map((p) => ({ name: p.name, score: p.score }));
 
+  const now = Date.now();
+
   // Player Loop
   for (const id in players) {
     const p = players[id];
     const stats = KITS[p.kit];
 
-    if (p.invincible > 0) p.invincible--;
+    // Calculate Boolean for Client
+    p.isInvincible = now < p.invincibleUntil;
+
+    // Regen
     if (p.hp < p.maxHp && p.regenTimer <= 0)
       p.hp = Math.min(p.maxHp, p.hp + 0.15);
     if (p.regenTimer > 0) p.regenTimer--;
 
-    // Stamina
+    // Speed & Stamina
     let speed = stats.speed;
     if (p.input.shift && p.stamina > 0) {
       speed *= 1.4;
@@ -273,56 +276,27 @@ setInterval(() => {
       p.isSprinting = false;
     }
 
-    // --- IMPROVED WALL SLIDING MOVEMENT ---
-    // We handle X and Y separately.
-    // If X hits a wall, we cancel X but keep Y.
-
-    let dx = 0;
-    let dy = 0;
+    // --- SLIDING PHYSICS ---
+    let dx = 0,
+      dy = 0;
     if (p.input.w) dy -= speed;
     if (p.input.s) dy += speed;
     if (p.input.a) dx -= speed;
     if (p.input.d) dx += speed;
 
-    // Normalize diagonal speed
     if (dx !== 0 && dy !== 0) {
-      const length = Math.sqrt(dx * dx + dy * dy);
-      dx = (dx / length) * speed;
-      dy = (dy / length) * speed;
+      const factor = 1 / Math.sqrt(2);
+      dx *= factor;
+      dy *= factor;
     }
 
-    // Apply X
     if (dx !== 0) {
       p.x += dx;
-      // Check Collision X
-      let collidedX = false;
-      if (p.x < 0 || p.x > MAP_SIZE) collidedX = true;
-      else {
-        for (const obs of obstacles) {
-          if (checkRectCollision({ x: p.x, y: p.y, r: stats.size }, obs)) {
-            collidedX = true;
-            break;
-          }
-        }
-      }
-      if (collidedX) p.x -= dx; // Revert X only
+      if (isColliding(p, stats.size)) p.x -= dx;
     }
-
-    // Apply Y
     if (dy !== 0) {
       p.y += dy;
-      // Check Collision Y
-      let collidedY = false;
-      if (p.y < 0 || p.y > MAP_SIZE) collidedY = true;
-      else {
-        for (const obs of obstacles) {
-          if (checkRectCollision({ x: p.x, y: p.y, r: stats.size }, obs)) {
-            collidedY = true;
-            break;
-          }
-        }
-      }
-      if (collidedY) p.y -= dy; // Revert Y only
+      if (isColliding(p, stats.size)) p.y -= dy;
     }
 
     if (p.cooldown > 0) p.cooldown--;
@@ -341,7 +315,7 @@ setInterval(() => {
     }
   }
 
-  // Bullets
+  // Bullet Loop
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
     b.x += b.vx;
@@ -376,7 +350,8 @@ setInterval(() => {
 
     for (const id in players) {
       const p = players[id];
-      if (b.ownerId !== p.id && p.invincible <= 0) {
+      // HIT LOGIC: Check strict boolean
+      if (b.ownerId !== p.id && !p.isInvincible) {
         const dx = p.x - b.x;
         const dy = p.y - b.y;
         if (Math.sqrt(dx * dx + dy * dy) < KITS[p.kit].size) {
