@@ -5,40 +5,36 @@ const server = http.createServer(app);
 const { Server } = require("socket.io");
 
 const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"],
-        credentials: false
-    }
+    cors: { origin: "*", methods: ["GET", "POST"], credentials: false }
 });
 
 app.use(express.static('public'));
 
-// --- Game Config ---
+// --- CONFIG ---
 const FPS = 60;
-const MAP_SIZE = 2000;
-const OBSTACLE_COUNT = 25; // More obstacles now that they don't overlap
+const MAP_SIZE = 2500; // Made map slightly bigger
+const OBSTACLE_COUNT = 30;
+const ORB_COUNT = 60; // Number of XP orbs
 
+// Spread = variance in shooting angle (0.1 is inaccurate, 0 is perfect)
 const KITS = {
-    assault: { name: "Assault", hp: 100, speed: 5, size: 20, reload: 15, dmg: 10, bulletSpeed: 12, range: 450, color: '#3498db' },
-    sniper:  { name: "Sniper",  hp: 60,  speed: 6, size: 18, reload: 60, dmg: 45, bulletSpeed: 25, range: 900, color: '#e74c3c' },
-    tank:    { name: "Tank",    hp: 200, speed: 3, size: 28, reload: 30, dmg: 20, bulletSpeed: 8,  range: 300, color: '#27ae60' }
+    assault: { name: "Assault", hp: 100, speed: 5, size: 22, reload: 10, dmg: 8,  bulletSpeed: 14, range: 450, color: '#3498db', spread: 0.1 },
+    sniper:  { name: "Sniper",  hp: 60,  speed: 6, size: 20, reload: 50, dmg: 40, bulletSpeed: 28, range: 1000, color: '#e74c3c', spread: 0.01 },
+    tank:    { name: "Tank",    hp: 200, speed: 3.5,size: 30, reload: 25, dmg: 18, bulletSpeed: 10, range: 350,  color: '#27ae60', spread: 0.05 }
 };
 
 let players = {};
 let bullets = [];
 let obstacles = [];
+let orbs = [];
 let bulletIdCounter = 0;
 
-// --- Helper: Collision Detection ---
+// --- UTILS ---
 function checkRectCollision(circle, rect) {
-    // Expand rect slightly for player collision to prevent clipping
     const testX = Math.max(rect.x, Math.min(circle.x, rect.x + rect.w));
     const testY = Math.max(rect.y, Math.min(circle.y, rect.y + rect.h));
-
     const distX = circle.x - testX;
     const distY = circle.y - testY;
-    
     return (distX * distX + distY * distY) < (circle.r * circle.r);
 }
 
@@ -49,72 +45,65 @@ function checkRectOverlap(r1, r2, padding = 0) {
              r2.y + r2.h + padding < r1.y);
 }
 
-// --- Generate Smart Obstacles ---
+// --- GENERATION ---
 function generateObstacles() {
     obstacles = [];
     let attempts = 0;
     while (obstacles.length < OBSTACLE_COUNT && attempts < 1000) {
-        const w = 60 + Math.random() * 100;
-        const h = 60 + Math.random() * 100;
+        const w = 80 + Math.random() * 100;
+        const h = 80 + Math.random() * 100;
         const x = Math.random() * (MAP_SIZE - w);
         const y = Math.random() * (MAP_SIZE - h);
-        
         const newObs = { x, y, w, h };
+        
         let valid = true;
-
-        // Check if overlaps with existing obstacles (with 50px buffer)
         for (const obs of obstacles) {
-            if (checkRectOverlap(newObs, obs, 50)) {
-                valid = false;
-                break;
-            }
+            if (checkRectOverlap(newObs, obs, 60)) valid = false;
         }
-
         if (valid) obstacles.push(newObs);
         attempts++;
     }
 }
-generateObstacles();
 
-// --- Find Safe Spawn Point ---
+function spawnOrb() {
+    return {
+        id: Math.random().toString(36).substr(2, 9),
+        x: Math.random() * MAP_SIZE,
+        y: Math.random() * MAP_SIZE,
+        r: 8 + Math.random() * 4 // Random size
+    };
+}
+
+// Initial Generation
+generateObstacles();
+for(let i=0; i<ORB_COUNT; i++) orbs.push(spawnOrb());
+
 function getSafeSpawn(radius) {
     let attempts = 0;
-    while (attempts < 100) {
+    while (attempts < 50) {
         const x = Math.random() * MAP_SIZE;
         const y = Math.random() * MAP_SIZE;
         let safe = true;
-
         for (const obs of obstacles) {
-            if (checkRectCollision({x, y, r: radius + 20}, obs)) { // +20 buffer
-                safe = false;
-                break;
-            }
+            if (checkRectCollision({x, y, r: radius + 30}, obs)) safe = false;
         }
         if (safe) return { x, y };
         attempts++;
     }
-    return { x: MAP_SIZE/2, y: MAP_SIZE/2 }; // Fallback to center
+    return { x: MAP_SIZE/2, y: MAP_SIZE/2 };
 }
 
 io.on('connection', (socket) => {
-    socket.emit('mapData', obstacles);
-
-    // Latency Check (Ping)
-    socket.on('latency_ping', (timestamp) => {
-        socket.emit('latency_pong', timestamp);
-    });
+    socket.emit('mapData', { obstacles }); // Send static data once
 
     socket.on('join_game', (kitName) => {
         const kit = KITS[kitName] || KITS.assault;
         const spawn = getSafeSpawn(kit.size);
-        
         players[socket.id] = {
             id: socket.id,
-            x: spawn.x,
-            y: spawn.y,
+            x: spawn.x, y: spawn.y,
             kit: kitName,
-            hp: kit.hp,
-            maxHp: kit.hp,
+            hp: kit.hp, maxHp: kit.hp,
             score: 0,
             angle: 0,
             cooldown: 0,
@@ -125,30 +114,36 @@ io.on('connection', (socket) => {
         io.emit('playerCount', Object.keys(players).length);
     });
 
-    socket.on('movement', (input) => {
-        if (players[socket.id]) {
-            players[socket.id].input = input;
-            players[socket.id].angle = input.angle;
-        }
-    });
-
     socket.on('shoot', () => {
         const p = players[socket.id];
         if (p && p.cooldown <= 0) {
             const stats = KITS[p.kit];
+            
+            // CALCULATE SPREAD
+            // (Math.random() - 0.5) returns -0.5 to 0.5. 
+            // We multiply by spread factor to jitter the angle.
+            const spreadAngle = (Math.random() - 0.5) * stats.spread;
+            const finalAngle = p.angle + spreadAngle;
+
             bullets.push({
                 id: bulletIdCounter++,
                 ownerId: p.id,
-                x: p.x,
-                y: p.y,
-                vx: Math.cos(p.angle) * stats.bulletSpeed,
-                vy: Math.sin(p.angle) * stats.bulletSpeed,
+                x: p.x, y: p.y,
+                vx: Math.cos(finalAngle) * stats.bulletSpeed,
+                vy: Math.sin(finalAngle) * stats.bulletSpeed,
                 range: stats.range,
                 traveled: 0,
                 dmg: stats.dmg
             });
             p.cooldown = stats.reload;
-            p.regenTimer = 180; // Stop regen for 3 seconds (60 ticks * 3)
+            p.regenTimer = 180; 
+        }
+    });
+
+    socket.on('movement', (input) => {
+        if (players[socket.id]) {
+            players[socket.id].input = input;
+            players[socket.id].angle = input.angle;
         }
     });
 
@@ -159,30 +154,29 @@ io.on('connection', (socket) => {
 });
 
 setInterval(() => {
-    // 1. Update Players
+    // 1. UPDATE PLAYERS
     for (const id in players) {
         const p = players[id];
         const stats = KITS[p.kit];
         
-        // Regen Logic (Passive Healing)
+        // Passive Regen
         if (p.hp < p.maxHp) {
             if (p.regenTimer > 0) p.regenTimer--;
-            else p.hp = Math.min(p.maxHp, p.hp + 0.1);
+            else p.hp = Math.min(p.maxHp, p.hp + 0.15);
         }
 
         // Sprint
         let speed = stats.speed;
         if (p.input.shift && p.stamina > 0) {
             speed *= 1.4;
-            p.stamina = Math.max(0, p.stamina - 1.5);
+            p.stamina = Math.max(0, p.stamina - 1.2);
             p.isSprinting = true;
         } else {
-            p.stamina = Math.min(100, p.stamina + 0.8);
+            p.stamina = Math.min(100, p.stamina + 0.6);
             p.isSprinting = false;
         }
 
-        // Movement with Independent Axis (Wall Sliding)
-        // We calculate X and Y separately. If X is blocked, we still allow Y movement.
+        // Move with Wall Sliding
         const moves = [
             { axis: 'y', val: -speed, input: p.input.w },
             { axis: 'y', val: speed,  input: p.input.s },
@@ -192,33 +186,41 @@ setInterval(() => {
 
         for (const m of moves) {
             if (m.input) {
-                const originalPos = p[m.axis];
+                const original = p[m.axis];
                 p[m.axis] += m.val;
-
-                // Check collision at new spot
                 let collided = false;
                 for (const obs of obstacles) {
                     if (checkRectCollision({x: p.x, y: p.y, r: stats.size}, obs)) {
-                        collided = true;
-                        break;
+                        collided = true; break;
                     }
                 }
-
-                // If collided, revert ONLY this axis
-                if (collided) {
-                    p[m.axis] = originalPos;
-                }
+                if (collided) p[m.axis] = original;
             }
         }
-
-        // Map Boundaries
+        
+        // Keep in bounds
         p.x = Math.max(0, Math.min(MAP_SIZE, p.x));
         p.y = Math.max(0, Math.min(MAP_SIZE, p.y));
-
         if (p.cooldown > 0) p.cooldown--;
+
+        // ORB COLLISION
+        for (let i = orbs.length - 1; i >= 0; i--) {
+            const orb = orbs[i];
+            const dx = p.x - orb.x;
+            const dy = p.y - orb.y;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            
+            if (dist < stats.size + orb.r) {
+                // Collect Orb
+                p.score += 5; // Small score boost
+                p.hp = Math.min(p.maxHp, p.hp + 10); // Heal 10 HP
+                orbs.splice(i, 1);
+                orbs.push(spawnOrb()); // Respawn immediately elsewhere
+            }
+        }
     }
 
-    // 2. Update Bullets
+    // 2. UPDATE BULLETS
     for (let i = bullets.length - 1; i >= 0; i--) {
         const b = bullets[i];
         b.x += b.vx;
@@ -226,45 +228,46 @@ setInterval(() => {
         b.traveled += Math.sqrt(b.vx*b.vx + b.vy*b.vy);
 
         if (b.traveled > b.range || b.x < 0 || b.x > MAP_SIZE || b.y < 0 || b.y > MAP_SIZE) {
-            bullets.splice(i, 1);
-            continue;
+            bullets.splice(i, 1); continue;
         }
 
-        // Obstacle Collision
+        // Walls
         let hitWall = false;
         for (const obs of obstacles) {
             if (b.x > obs.x && b.x < obs.x + obs.w && b.y > obs.y && b.y < obs.y + obs.h) {
                 bullets.splice(i, 1);
-                hitWall = true;
-                break;
+                hitWall = true; break;
             }
         }
         if (hitWall) continue;
 
-        // Player Collision
+        // Players
         for (const id in players) {
             const p = players[id];
             if (b.ownerId !== p.id) {
                 const dx = p.x - b.x;
                 const dy = p.y - b.y;
-                const dist = Math.sqrt(dx*dx + dy*dy);
-                if (dist < KITS[p.kit].size) {
+                if (Math.sqrt(dx*dx + dy*dy) < KITS[p.kit].size) {
                     p.hp -= b.dmg;
-                    p.regenTimer = 300; // Reset regen timer on hit (5s)
+                    p.regenTimer = 300;
                     bullets.splice(i, 1);
-                    
                     io.emit('hit', { x: b.x, y: b.y });
 
                     if (p.hp <= 0) {
                         const killer = players[b.ownerId];
-                        if (killer) killer.score++;
+                        const killerName = killer ? KITS[killer.kit].name : "Unknown";
+                        const victimName = KITS[p.kit].name;
                         
-                        // Respawn safely
+                        // Emit Kill Feed Event
+                        io.emit('kill_feed', { killer: killerName, victim: victimName });
+
+                        if (killer) {
+                            killer.score += 100;
+                            killer.hp = Math.min(killer.maxHp, killer.hp + 30); // Heal on kill
+                        }
+                        
                         const spawn = getSafeSpawn(KITS[p.kit].size);
-                        p.hp = p.maxHp;
-                        p.x = spawn.x;
-                        p.y = spawn.y;
-                        p.stamina = 100;
+                        p.hp = p.maxHp; p.x = spawn.x; p.y = spawn.y; p.stamina = 100;
                     }
                     break;
                 }
@@ -272,7 +275,7 @@ setInterval(() => {
         }
     }
 
-    io.emit('state', { players, bullets });
+    io.emit('state', { players, bullets, orbs });
 }, 1000 / FPS);
 
 const PORT = process.env.PORT || 3000;
