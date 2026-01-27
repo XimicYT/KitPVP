@@ -4,23 +4,21 @@ const http = require('http');
 const server = http.createServer(app);
 const { Server } = require("socket.io");
 
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"], credentials: false }
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
 app.use(express.static('public'));
 
-// --- CONFIG ---
+// --- CONSTANTS ---
 const FPS = 60;
-const MAP_SIZE = 2500; // Made map slightly bigger
-const OBSTACLE_COUNT = 30;
-const ORB_COUNT = 60; // Number of XP orbs
+const MAP_SIZE = 3000;
+const OBSTACLE_COUNT = 40;
+const ORB_COUNT = 50;
 
-// Spread = variance in shooting angle (0.1 is inaccurate, 0 is perfect)
 const KITS = {
-    assault: { name: "Assault", hp: 100, speed: 5, size: 22, reload: 10, dmg: 8,  bulletSpeed: 14, range: 450, color: '#3498db', spread: 0.1 },
-    sniper:  { name: "Sniper",  hp: 60,  speed: 6, size: 20, reload: 50, dmg: 40, bulletSpeed: 28, range: 1000, color: '#e74c3c', spread: 0.01 },
-    tank:    { name: "Tank",    hp: 200, speed: 3.5,size: 30, reload: 25, dmg: 18, bulletSpeed: 10, range: 350,  color: '#27ae60', spread: 0.05 }
+    assault: { name: "Assault", hp: 100, maxHp: 100, speed: 5, size: 22, reload: 10, dmg: 8,  bulletSpeed: 14, range: 450, color: '#3498db', spread: 0.1 },
+    sniper:  { name: "Sniper",  hp: 60,  maxHp: 60,  speed: 6, size: 20, reload: 50, dmg: 40, bulletSpeed: 28, range: 1000, color: '#e74c3c', spread: 0.01 },
+    tank:    { name: "Tank",    hp: 200, maxHp: 200, speed: 3.5,size: 30, reload: 25, dmg: 18, bulletSpeed: 10, range: 350,  color: '#27ae60', spread: 0.05 },
+    shotgun: { name: "Shotgun", hp: 120, maxHp: 120, speed: 5, size: 24, reload: 40, dmg: 8,  bulletSpeed: 12, range: 300,  color: '#9b59b6', spread: 0.2, count: 5 } // New Class
 };
 
 let players = {};
@@ -50,33 +48,69 @@ function generateObstacles() {
     obstacles = [];
     let attempts = 0;
     while (obstacles.length < OBSTACLE_COUNT && attempts < 1000) {
-        const w = 80 + Math.random() * 100;
-        const h = 80 + Math.random() * 100;
+        const w = 80 + Math.random() * 120;
+        const h = 80 + Math.random() * 120;
         const x = Math.random() * (MAP_SIZE - w);
         const y = Math.random() * (MAP_SIZE - h);
         const newObs = { x, y, w, h };
         
         let valid = true;
         for (const obs of obstacles) {
-            if (checkRectOverlap(newObs, obs, 60)) valid = false;
+            if (checkRectOverlap(newObs, obs, 50)) valid = false;
         }
         if (valid) obstacles.push(newObs);
         attempts++;
     }
 }
+generateObstacles();
 
-function spawnOrb() {
-    return {
-        id: Math.random().toString(36).substr(2, 9),
-        x: Math.random() * MAP_SIZE,
-        y: Math.random() * MAP_SIZE,
-        r: 8 + Math.random() * 4 // Random size
-    };
+function getSafeOrbLocation() {
+    let attempts = 0;
+    while (attempts < 50) {
+        const x = Math.random() * MAP_SIZE;
+        const y = Math.random() * MAP_SIZE;
+        const r = 8 + Math.random() * 4;
+        let valid = true;
+
+        // 1. Check Obstacles
+        for (const obs of obstacles) {
+            if (checkRectCollision({x, y, r: r + 5}, obs)) valid = false;
+        }
+
+        // 2. Check Viewport (Don't spawn too close to ANY player)
+        // We want them to spawn "off screen" if possible
+        if (valid) {
+            for (const id in players) {
+                const p = players[id];
+                const dx = p.x - x;
+                const dy = p.y - y;
+                // If within 900px of a player, try again (approx view distance)
+                if (Math.sqrt(dx*dx + dy*dy) < 900) {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+
+        if (valid) return { x, y, r };
+        attempts++;
+    }
+    // Fallback if map is too crowded
+    return { x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE, r: 10 };
 }
 
-// Initial Generation
-generateObstacles();
-for(let i=0; i<ORB_COUNT; i++) orbs.push(spawnOrb());
+// Spawn Orbs with delay
+function scheduleOrbSpawn() {
+    if (orbs.length < ORB_COUNT) {
+        setTimeout(() => {
+            const orb = getSafeOrbLocation();
+            orb.id = Math.random().toString(36).substr(2, 9);
+            orbs.push(orb);
+        }, Math.random() * 2000 + 1000); // 1-3 second delay
+    }
+}
+// Initial fill
+for(let i=0; i<ORB_COUNT; i++) orbs.push({ ...getSafeOrbLocation(), id: i });
 
 function getSafeSpawn(radius) {
     let attempts = 0;
@@ -93,25 +127,38 @@ function getSafeSpawn(radius) {
     return { x: MAP_SIZE/2, y: MAP_SIZE/2 };
 }
 
+// --- SOCKETS ---
 io.on('connection', (socket) => {
-    socket.emit('mapData', { obstacles }); // Send static data once
+    socket.emit('mapData', { obstacles });
 
-    socket.on('join_game', (kitName) => {
-        const kit = KITS[kitName] || KITS.assault;
+    // 1. Validate Name
+    socket.on('check_name', (name) => {
+        let taken = false;
+        for(let id in players) {
+            if(players[id].name.toLowerCase() === name.toLowerCase()) taken = true;
+        }
+        socket.emit('name_checked', { taken: taken, name: name });
+    });
+
+    // 2. Join Game
+    socket.on('join_game', (data) => {
+        const kit = KITS[data.kit] || KITS.assault;
         const spawn = getSafeSpawn(kit.size);
+        
         players[socket.id] = {
             id: socket.id,
+            name: data.name,
             x: spawn.x, y: spawn.y,
-            kit: kitName,
-            hp: kit.hp, maxHp: kit.hp,
+            kit: data.kit,
+            hp: kit.hp, maxHp: kit.maxHp,
             score: 0,
             angle: 0,
             cooldown: 0,
             stamina: 100,
             regenTimer: 0,
+            invincible: 180, // 3 seconds at 60 FPS
             input: { w: false, a: false, s: false, d: false, shift: false }
         };
-        io.emit('playerCount', Object.keys(players).length);
     });
 
     socket.on('shoot', () => {
@@ -119,22 +166,24 @@ io.on('connection', (socket) => {
         if (p && p.cooldown <= 0) {
             const stats = KITS[p.kit];
             
-            // CALCULATE SPREAD
-            // (Math.random() - 0.5) returns -0.5 to 0.5. 
-            // We multiply by spread factor to jitter the angle.
-            const spreadAngle = (Math.random() - 0.5) * stats.spread;
-            const finalAngle = p.angle + spreadAngle;
+            // Shotgun logic vs Normal logic
+            const count = stats.count || 1;
+            
+            for(let i=0; i<count; i++) {
+                const spreadAngle = (Math.random() - 0.5) * stats.spread;
+                const finalAngle = p.angle + spreadAngle;
 
-            bullets.push({
-                id: bulletIdCounter++,
-                ownerId: p.id,
-                x: p.x, y: p.y,
-                vx: Math.cos(finalAngle) * stats.bulletSpeed,
-                vy: Math.sin(finalAngle) * stats.bulletSpeed,
-                range: stats.range,
-                traveled: 0,
-                dmg: stats.dmg
-            });
+                bullets.push({
+                    id: bulletIdCounter++,
+                    ownerId: p.id,
+                    x: p.x, y: p.y,
+                    vx: Math.cos(finalAngle) * stats.bulletSpeed,
+                    vy: Math.sin(finalAngle) * stats.bulletSpeed,
+                    range: stats.range,
+                    traveled: 0,
+                    dmg: stats.dmg
+                });
+            }
             p.cooldown = stats.reload;
             p.regenTimer = 180; 
         }
@@ -149,21 +198,27 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         delete players[socket.id];
-        io.emit('playerCount', Object.keys(players).length);
     });
 });
 
 setInterval(() => {
+    // Leaderboard Calc
+    const leaderboard = Object.values(players)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 5)
+        .map(p => ({ name: p.name, score: p.score }));
+
     // 1. UPDATE PLAYERS
     for (const id in players) {
         const p = players[id];
         const stats = KITS[p.kit];
         
-        // Passive Regen
-        if (p.hp < p.maxHp) {
-            if (p.regenTimer > 0) p.regenTimer--;
-            else p.hp = Math.min(p.maxHp, p.hp + 0.15);
-        }
+        // Invincibility
+        if (p.invincible > 0) p.invincible--;
+
+        // Regen
+        if (p.hp < p.maxHp && p.regenTimer <= 0) p.hp = Math.min(p.maxHp, p.hp + 0.15);
+        if (p.regenTimer > 0) p.regenTimer--;
 
         // Sprint
         let speed = stats.speed;
@@ -176,7 +231,7 @@ setInterval(() => {
             p.isSprinting = false;
         }
 
-        // Move with Wall Sliding
+        // Movement (Wall Sliding)
         const moves = [
             { axis: 'y', val: -speed, input: p.input.w },
             { axis: 'y', val: speed,  input: p.input.s },
@@ -198,7 +253,6 @@ setInterval(() => {
             }
         }
         
-        // Keep in bounds
         p.x = Math.max(0, Math.min(MAP_SIZE, p.x));
         p.y = Math.max(0, Math.min(MAP_SIZE, p.y));
         if (p.cooldown > 0) p.cooldown--;
@@ -208,14 +262,11 @@ setInterval(() => {
             const orb = orbs[i];
             const dx = p.x - orb.x;
             const dy = p.y - orb.y;
-            const dist = Math.sqrt(dx*dx + dy*dy);
-            
-            if (dist < stats.size + orb.r) {
-                // Collect Orb
-                p.score += 5; // Small score boost
-                p.hp = Math.min(p.maxHp, p.hp + 10); // Heal 10 HP
+            if (Math.sqrt(dx*dx + dy*dy) < stats.size + orb.r) {
+                p.score += 5;
+                p.hp = Math.min(p.maxHp, p.hp + 10);
                 orbs.splice(i, 1);
-                orbs.push(spawnOrb()); // Respawn immediately elsewhere
+                scheduleOrbSpawn(); // Delayed respawn
             }
         }
     }
@@ -231,20 +282,18 @@ setInterval(() => {
             bullets.splice(i, 1); continue;
         }
 
-        // Walls
         let hitWall = false;
         for (const obs of obstacles) {
             if (b.x > obs.x && b.x < obs.x + obs.w && b.y > obs.y && b.y < obs.y + obs.h) {
-                bullets.splice(i, 1);
-                hitWall = true; break;
+                bullets.splice(i, 1); hitWall = true; break;
             }
         }
         if (hitWall) continue;
 
-        // Players
         for (const id in players) {
             const p = players[id];
-            if (b.ownerId !== p.id) {
+            // Hit logic: Not owner, AND player is NOT invincible
+            if (b.ownerId !== p.id && p.invincible <= 0) {
                 const dx = p.x - b.x;
                 const dy = p.y - b.y;
                 if (Math.sqrt(dx*dx + dy*dy) < KITS[p.kit].size) {
@@ -255,19 +304,20 @@ setInterval(() => {
 
                     if (p.hp <= 0) {
                         const killer = players[b.ownerId];
-                        const killerName = killer ? KITS[killer.kit].name : "Unknown";
-                        const victimName = KITS[p.kit].name;
+                        const killerName = killer ? killer.name : "Unknown";
                         
-                        // Emit Kill Feed Event
-                        io.emit('kill_feed', { killer: killerName, victim: victimName });
+                        io.emit('kill_feed', { killer: killerName, victim: p.name });
+                        
+                        // Notify victim they died
+                        io.to(p.id).emit('you_died', { killer: killerName });
 
                         if (killer) {
                             killer.score += 100;
-                            killer.hp = Math.min(killer.maxHp, killer.hp + 30); // Heal on kill
+                            killer.hp = Math.min(killer.maxHp, killer.hp + 30);
                         }
                         
-                        const spawn = getSafeSpawn(KITS[p.kit].size);
-                        p.hp = p.maxHp; p.x = spawn.x; p.y = spawn.y; p.stamina = 100;
+                        // Remove player immediately, they must rejoin
+                        delete players[id];
                     }
                     break;
                 }
@@ -275,7 +325,7 @@ setInterval(() => {
         }
     }
 
-    io.emit('state', { players, bullets, orbs });
+    io.emit('state', { players, bullets, orbs, leaderboard });
 }, 1000 / FPS);
 
 const PORT = process.env.PORT || 3000;
