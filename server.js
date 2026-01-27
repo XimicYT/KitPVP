@@ -4,9 +4,10 @@ const http = require('http');
 const server = http.createServer(app);
 const { Server } = require("socket.io");
 
+// ALLOW CORS (So you can host on Netlify later if you want)
 const io = new Server(server, {
     cors: {
-        origin: "*",  // "*" means allow ANY website to connect.
+        origin: "*",
         methods: ["GET", "POST"]
     }
 });
@@ -18,19 +19,18 @@ const FPS = 60;
 const MAP_SIZE = 2000;
 
 const KITS = {
-    assault: { name: "Assault", hp: 100, speed: 5, size: 20, color: '#3498db', reload: 15, dmg: 10, bulletSpeed: 12, range: 400 },
-    sniper:  { name: "Sniper",  hp: 60,  speed: 6, size: 18, color: '#e74c3c', reload: 60, dmg: 45, bulletSpeed: 25, range: 800 },
-    tank:    { name: "Tank",    hp: 200, speed: 3, size: 28, color: '#27ae60', reload: 30, dmg: 20, bulletSpeed: 8,  range: 300 }
+    assault: { name: "Assault", hp: 100, speed: 5, size: 20, reload: 15, dmg: 10, bulletSpeed: 12, range: 400 },
+    sniper:  { name: "Sniper",  hp: 60,  speed: 6, size: 18, reload: 60, dmg: 45, bulletSpeed: 25, range: 800 },
+    tank:    { name: "Tank",    hp: 200, speed: 3, size: 28, reload: 30, dmg: 20, bulletSpeed: 8,  range: 300 }
 };
 
-// --- Game State ---
 let players = {};
 let bullets = [];
 let bulletIdCounter = 0;
 
-// --- Physics & Logic ---
 io.on('connection', (socket) => {
-    console.log('Player connected:', socket.id);
+    // 1. Send total count to everyone when a new person connects
+    io.emit('playerCount', io.engine.clientsCount);
 
     socket.on('join_game', (kitName) => {
         const kit = KITS[kitName] || KITS.assault;
@@ -50,8 +50,8 @@ io.on('connection', (socket) => {
 
     socket.on('movement', (input) => {
         if (players[socket.id]) {
-            players[socket.id].input = input; // Update input state
-            players[socket.id].angle = input.angle; // Look direction
+            players[socket.id].input = input;
+            players[socket.id].angle = input.angle;
         }
     });
 
@@ -76,13 +76,14 @@ io.on('connection', (socket) => {
 
     socket.on('disconnect', () => {
         delete players[socket.id];
-        console.log('Player disconnected:', socket.id);
+        // 2. Update count when someone leaves
+        io.emit('playerCount', io.engine.clientsCount);
     });
 });
 
-// --- Server Game Loop (60 Ticks per Second) ---
+// Game Loop
 setInterval(() => {
-    // 1. Update Players
+    // Player Logic
     for (const id in players) {
         const p = players[id];
         const stats = KITS[p.kit];
@@ -92,63 +93,48 @@ setInterval(() => {
         if (p.input.a) p.x -= stats.speed;
         if (p.input.d) p.x += stats.speed;
 
-        // Map boundaries
         p.x = Math.max(0, Math.min(MAP_SIZE, p.x));
         p.y = Math.max(0, Math.min(MAP_SIZE, p.y));
 
         if (p.cooldown > 0) p.cooldown--;
     }
 
-    // 2. Update Bullets
+    // Bullet Logic
     for (let i = bullets.length - 1; i >= 0; i--) {
         const b = bullets[i];
         b.x += b.vx;
         b.y += b.vy;
-        
-        const speed = Math.sqrt(b.vx*b.vx + b.vy*b.vy);
-        b.traveled += speed;
+        b.traveled += Math.sqrt(b.vx*b.vx + b.vy*b.vy);
 
-        // Remove if out of range or out of bounds
         if (b.traveled > b.range || b.x < 0 || b.x > MAP_SIZE || b.y < 0 || b.y > MAP_SIZE) {
             bullets.splice(i, 1);
             continue;
         }
 
-        // Collision Detection
         for (const id in players) {
             const p = players[id];
             if (b.ownerId !== p.id) {
                 const dx = p.x - b.x;
                 const dy = p.y - b.y;
                 const dist = Math.sqrt(dx*dx + dy*dy);
-                const pSize = KITS[p.kit].size;
-
-                if (dist < pSize) {
-                    // Hit!
+                if (dist < KITS[p.kit].size) {
                     p.hp -= b.dmg;
                     bullets.splice(i, 1);
-                    
-                    // Death Logic
                     if (p.hp <= 0) {
                         const killer = players[b.ownerId];
                         if (killer) killer.score++;
-                        // Respawn victim
                         p.hp = p.maxHp;
                         p.x = Math.random() * MAP_SIZE;
                         p.y = Math.random() * MAP_SIZE;
                     }
-                    break; 
+                    break;
                 }
             }
         }
     }
 
-    // 3. Send State to Clients
     io.emit('state', { players, bullets });
-
 }, 1000 / FPS);
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
