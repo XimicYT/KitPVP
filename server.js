@@ -3,7 +3,13 @@ const app = express();
 const http = require('http');
 const server = http.createServer(app);
 const { Server } = require("socket.io");
-const io = new Server(server);
+
+const io = new Server(server, {
+    cors: {
+        origin: "*",  // "*" means allow ANY website to connect.
+        methods: ["GET", "POST"]
+    }
+});
 
 app.use(express.static('public'));
 
