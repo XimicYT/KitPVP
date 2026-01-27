@@ -11,10 +11,10 @@ app.use(express.static("public"));
 // --- CONFIG ---
 const FPS = 60;
 const MAP_SIZE = 1600;
-const OBSTACLE_COUNT = 30;
-const ORB_COUNT = 50;
+const OBSTACLE_COUNT = 15; // Reduced for more open space
+const ORB_COUNT = 30; // Reduced clutter
 
-// Kits (lowercase keys for consistency)
+// Kits
 const KITS = {
   assault: {
     name: "Assault",
@@ -73,13 +73,19 @@ let obstacles = [];
 let orbs = [];
 let bulletIdCounter = 0;
 
-// --- UTILS ---
+// --- PHYSICS ENGINE ---
 function checkRectCollision(circle, rect) {
-  const testX = Math.max(rect.x, Math.min(circle.x, rect.x + rect.w));
-  const testY = Math.max(rect.y, Math.min(circle.y, rect.y + rect.h));
-  const distX = circle.x - testX;
-  const distY = circle.y - testY;
-  return distX * distX + distY * distY < circle.r * circle.r;
+  // Find the closest point to the circle within the rectangle
+  const closestX = Math.max(rect.x, Math.min(circle.x, rect.x + rect.w));
+  const closestY = Math.max(rect.y, Math.min(circle.y, rect.y + rect.h));
+
+  // Calculate the distance between the circle's center and this closest point
+  const distanceX = circle.x - closestX;
+  const distanceY = circle.y - closestY;
+
+  // If the distance is less than the circle's radius, an intersection occurs
+  const distanceSquared = distanceX * distanceX + distanceY * distanceY;
+  return distanceSquared < circle.r * circle.r;
 }
 
 function checkRectOverlap(r1, r2, padding = 0) {
@@ -96,15 +102,15 @@ function generateObstacles() {
   obstacles = [];
   let attempts = 0;
   while (obstacles.length < OBSTACLE_COUNT && attempts < 1000) {
-    const w = 60 + Math.random() * 100;
-    const h = 60 + Math.random() * 100;
+    const w = 80 + Math.random() * 120; // Slightly larger obstacles
+    const h = 80 + Math.random() * 120;
     const x = Math.random() * (MAP_SIZE - w);
     const y = Math.random() * (MAP_SIZE - h);
     const newObs = { x, y, w, h };
 
     let valid = true;
     for (const obs of obstacles) {
-      if (checkRectOverlap(newObs, obs, 40)) valid = false;
+      if (checkRectOverlap(newObs, obs, 100)) valid = false; // More space between obstacles
     }
     if (valid) obstacles.push(newObs);
     attempts++;
@@ -117,30 +123,20 @@ function getSafeOrbLocation() {
   while (attempts < 50) {
     const x = Math.random() * MAP_SIZE;
     const y = Math.random() * MAP_SIZE;
-    const r = 8 + Math.random() * 4;
+    const r = 10; // Fixed Orb Size
     let valid = true;
 
-    // 1. Check Border (50px padding from edge)
     if (x < 50 || x > MAP_SIZE - 50 || y < 50 || y > MAP_SIZE - 50)
       valid = false;
-
-    // 2. Check Obstacles
     if (valid) {
       for (const obs of obstacles) {
-        // Add extra buffer so it doesn't touch the wall
-        if (checkRectCollision({ x, y, r: r + 15 }, obs)) valid = false;
+        if (checkRectCollision({ x, y, r: r + 20 }, obs)) valid = false;
       }
     }
-
     if (valid) return { x, y, r };
     attempts++;
   }
-  // Fallback: Center safe zone
-  return {
-    x: MAP_SIZE / 2 + (Math.random() - 0.5) * 100,
-    y: MAP_SIZE / 2 + (Math.random() - 0.5) * 100,
-    r: 10,
-  };
+  return { x: MAP_SIZE / 2, y: MAP_SIZE / 2, r: 10 };
 }
 
 function scheduleOrbSpawn() {
@@ -164,11 +160,8 @@ function getSafeSpawn(radius) {
     const x = Math.random() * MAP_SIZE;
     const y = Math.random() * MAP_SIZE;
     let safe = true;
-
-    // Border check
     if (x < 50 || x > MAP_SIZE - 50 || y < 50 || y > MAP_SIZE - 50)
       safe = false;
-
     for (const obs of obstacles) {
       if (checkRectCollision({ x, y, r: radius + 20 }, obs)) safe = false;
     }
@@ -180,13 +173,9 @@ function getSafeSpawn(radius) {
 
 // --- SOCKETS ---
 io.on("connection", (socket) => {
-  // Send map data immediately
   socket.emit("mapData", { obstacles });
 
-  // Ping / Latency check
-  socket.on("latency", (callback) => {
-    callback(); // Simply respond to acknowledge
-  });
+  socket.on("latency", (cb) => cb());
 
   socket.on("check_name", (name) => {
     let taken = false;
@@ -206,7 +195,7 @@ io.on("connection", (socket) => {
       name: data.name,
       x: spawn.x,
       y: spawn.y,
-      kit: kitKey, // Store the key (e.g., 'sniper')
+      kit: kitKey,
       hp: kit.hp,
       maxHp: kit.maxHp,
       score: 0,
@@ -257,11 +246,13 @@ io.on("connection", (socket) => {
 });
 
 setInterval(() => {
+  // Leaderboard
   const leaderboard = Object.values(players)
     .sort((a, b) => b.score - a.score)
     .slice(0, 5)
     .map((p) => ({ name: p.name, score: p.score }));
 
+  // Player Loop
   for (const id in players) {
     const p = players[id];
     const stats = KITS[p.kit];
@@ -271,6 +262,7 @@ setInterval(() => {
       p.hp = Math.min(p.maxHp, p.hp + 0.15);
     if (p.regenTimer > 0) p.regenTimer--;
 
+    // Stamina
     let speed = stats.speed;
     if (p.input.shift && p.stamina > 0) {
       speed *= 1.4;
@@ -281,36 +273,58 @@ setInterval(() => {
       p.isSprinting = false;
     }
 
-    const moves = [
-      { axis: "y", val: -speed, input: p.input.w },
-      { axis: "y", val: speed, input: p.input.s },
-      { axis: "x", val: -speed, input: p.input.a },
-      { axis: "x", val: speed, input: p.input.d },
-    ];
+    // --- IMPROVED WALL SLIDING MOVEMENT ---
+    // We handle X and Y separately.
+    // If X hits a wall, we cancel X but keep Y.
 
-    for (const m of moves) {
-      if (m.input) {
-        const original = p[m.axis];
-        p[m.axis] += m.val;
-        let collided = false;
+    let dx = 0;
+    let dy = 0;
+    if (p.input.w) dy -= speed;
+    if (p.input.s) dy += speed;
+    if (p.input.a) dx -= speed;
+    if (p.input.d) dx += speed;
 
-        // Map Boundaries
-        if (p.x < 0 || p.x > MAP_SIZE || p.y < 0 || p.y > MAP_SIZE)
-          collided = true;
+    // Normalize diagonal speed
+    if (dx !== 0 && dy !== 0) {
+      const length = Math.sqrt(dx * dx + dy * dy);
+      dx = (dx / length) * speed;
+      dy = (dy / length) * speed;
+    }
 
-        // Obstacles
+    // Apply X
+    if (dx !== 0) {
+      p.x += dx;
+      // Check Collision X
+      let collidedX = false;
+      if (p.x < 0 || p.x > MAP_SIZE) collidedX = true;
+      else {
         for (const obs of obstacles) {
           if (checkRectCollision({ x: p.x, y: p.y, r: stats.size }, obs)) {
-            collided = true;
+            collidedX = true;
             break;
           }
         }
-        if (collided) p[m.axis] = original;
       }
+      if (collidedX) p.x -= dx; // Revert X only
     }
 
-    p.x = Math.max(0, Math.min(MAP_SIZE, p.x));
-    p.y = Math.max(0, Math.min(MAP_SIZE, p.y));
+    // Apply Y
+    if (dy !== 0) {
+      p.y += dy;
+      // Check Collision Y
+      let collidedY = false;
+      if (p.y < 0 || p.y > MAP_SIZE) collidedY = true;
+      else {
+        for (const obs of obstacles) {
+          if (checkRectCollision({ x: p.x, y: p.y, r: stats.size }, obs)) {
+            collidedY = true;
+            break;
+          }
+        }
+      }
+      if (collidedY) p.y -= dy; // Revert Y only
+    }
+
     if (p.cooldown > 0) p.cooldown--;
 
     // Orbs
@@ -327,6 +341,7 @@ setInterval(() => {
     }
   }
 
+  // Bullets
   for (let i = bullets.length - 1; i >= 0; i--) {
     const b = bullets[i];
     b.x += b.vx;
