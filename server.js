@@ -7,8 +7,9 @@ const { Server } = require("socket.io");
 // ALLOW CORS (So you can host on Netlify later if you want)
 const io = new Server(server, {
     cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
+        origin: "*",            // Allow connection from ANYWHERE (including file://)
+        methods: ["GET", "POST"],
+        credentials: false      // Must be false if origin is "*"
     }
 });
 
