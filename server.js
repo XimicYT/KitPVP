@@ -8,11 +8,11 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 app.use(express.static("public"));
 
-// --- CONFIG (Reverted to smaller, denser map) ---
+// --- CONFIG (CLASSIC TIGHT MAP) ---
 const FPS = 60;
-const MAP_SIZE = 2000;
-const OBSTACLE_COUNT = 25;
-const ORB_COUNT = 40;
+const MAP_SIZE = 1600; // Much smaller for instant action
+const OBSTACLE_COUNT = 30; // Dense obstacles
+const ORB_COUNT = 50; // Lots of XP everywhere
 
 const KITS = {
   assault: {
@@ -107,7 +107,7 @@ function generateObstacles() {
 
     let valid = true;
     for (const obs of obstacles) {
-      if (checkRectOverlap(newObs, obs, 50)) valid = false;
+      if (checkRectOverlap(newObs, obs, 40)) valid = false;
     }
     if (valid) obstacles.push(newObs);
     attempts++;
@@ -125,19 +125,7 @@ function getSafeOrbLocation() {
     for (const obs of obstacles) {
       if (checkRectCollision({ x, y, r: r + 5 }, obs)) valid = false;
     }
-    if (valid) {
-      for (const id in players) {
-        const p = players[id];
-        const dx = p.x - x;
-        const dy = p.y - y;
-        if (Math.sqrt(dx * dx + dy * dy) < 800) {
-          // Slightly reduced view distance buffer
-          valid = false;
-          break;
-        }
-      }
-    }
-    if (valid) return { x, y, r };
+    if (valid) return { x, y, r }; // Removed view distance check for classic chaos
     attempts++;
   }
   return { x: Math.random() * MAP_SIZE, y: Math.random() * MAP_SIZE, r: 10 };
@@ -151,7 +139,7 @@ function scheduleOrbSpawn() {
         orb.id = Math.random().toString(36).substr(2, 9);
         orbs.push(orb);
       },
-      Math.random() * 2000 + 1000,
+      Math.random() * 2000 + 500,
     );
   }
 }
