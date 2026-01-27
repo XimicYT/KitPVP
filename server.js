@@ -12,7 +12,7 @@ app.use(express.static('public'));
 const FPS = 60;
 const MAP_SIZE = 1600; 
 const OBSTACLE_COUNT = 12; 
-const ORB_COUNT = 25;
+const ORB_COUNT = 30; // Increased orb count slightly so mimics blend in better
 
 const KITS = {
     assault: { name: "Assault", hp: 100, maxHp: 100, speed: 5, size: 22, reload: 10, dmg: 8,  bulletSpeed: 14, range: 450, spread: 0.1 },
@@ -20,7 +20,10 @@ const KITS = {
     tank:    { name: "Tank",    hp: 200, maxHp: 200, speed: 3.5,size: 30, reload: 25, dmg: 18, bulletSpeed: 10, range: 350,  spread: 0.05 },
     shotgun: { name: "Shotgun", hp: 120, maxHp: 120, speed: 5, size: 24, reload: 40, dmg: 8,  bulletSpeed: 12, range: 300,  spread: 0.2, count: 5 },
     bouncy:  { name: "Bouncy Boi", hp: 150, maxHp: 150, speed: 0.8, size: 25, reload: 9999, dmg: 0, bulletSpeed: 0, range: 0, spread: 0 },
-    gravity: { name: "Gravity Guy", hp: 250, maxHp: 250, speed: 3.0, size: 35, reload: 9999, dmg: 2, bulletSpeed: 0, range: 450, spread: 0 }
+    gravity: { name: "Gravity Guy", hp: 250, maxHp: 250, speed: 3.0, size: 35, reload: 9999, dmg: 2, bulletSpeed: 0, range: 450, spread: 0 },
+    // MIMIC CLASS
+    mimic:   { name: "Mimic", hp: 100, maxHp: 100, speed: 5.5, size: 12, reload: 60, dmg: 70, bulletSpeed: 0, range: 0, spread: 0 } 
+    // Size 12 matches Orb size roughly
 };
 
 let players = {};
@@ -104,25 +107,19 @@ function scheduleOrbSpawn() {
 }
 for(let i=0; i<ORB_COUNT; i++) orbs.push({ ...getSafeOrbLocation(), id: i });
 
-// --- UPDATED SPAWN LOGIC (AVOIDS GRAVITY WELLS) ---
 function getSafeSpawn(radius) {
     let attempts = 0;
     while (attempts < 50) {
         const x = Math.random() * MAP_SIZE;
         const y = Math.random() * MAP_SIZE;
         let valid = true;
-
-        // 1. Check Map Boundaries & Obstacles
         if (isColliding({x, y}, radius + 50)) valid = false;
-
-        // 2. Check for Gravity Guys (Don't spawn inside a black hole)
         if (valid) {
             for (const id in players) {
                 const p = players[id];
                 if (p.kit === 'gravity') {
                     const dx = p.x - x;
                     const dy = p.y - y;
-                    // Ensure we spawn at least 'range' + buffer away
                     if (Math.sqrt(dx*dx + dy*dy) < KITS.gravity.range + 100) {
                         valid = false;
                         break;
@@ -130,7 +127,6 @@ function getSafeSpawn(radius) {
                 }
             }
         }
-
         if (valid) return { x, y };
         attempts++;
     }
@@ -174,7 +170,8 @@ io.on('connection', (socket) => {
 
     socket.on('shoot', () => {
         const p = players[socket.id];
-        if (p && p.kit !== 'bouncy' && p.cooldown <= 0) {
+        // MIMICS CANNOT SHOOT (They are living mines)
+        if (p && p.kit !== 'bouncy' && p.kit !== 'mimic' && p.cooldown <= 0) {
             const stats = KITS[p.kit];
             const count = stats.count || 1;
             for(let i=0; i<count; i++) {
@@ -217,13 +214,11 @@ setInterval(() => {
 
     const now = Date.now();
 
-    // 1. UPDATED GRAVITY LOGIC
+    // 1. GRAVITY LOGIC
     for (const id in players) {
         const p = players[id];
         if (p.kit === 'gravity') {
             const range = KITS.gravity.range;
-            
-            // Pull Players
             for (const targetId in players) {
                 if (id === targetId) continue;
                 const target = players[targetId];
@@ -234,23 +229,11 @@ setInterval(() => {
                 const dist = Math.sqrt(dx*dx + dy*dy);
 
                 if (dist < range) {
-                    // INVERSE DISTANCE SCALING
-                    // Closer = Stronger. 
-                    // At edge (dist = range): factor is 0.
-                    // At center (dist = 0): factor is 1.
                     const pullFactor = 1 - (dist / range);
-                    
-                    // Base force (weak at edge, strong at center)
-                    // Edge: 0.5, Center: 8.0
                     let force = 0.5 + (pullFactor * 7.5);
-                    
-                    // GRAVITY VS GRAVITY (The Singularity)
-                    if (target.kit === 'gravity') {
-                        force *= 2.0; // They pull each other faster
-                    }
+                    if (target.kit === 'gravity') force *= 2.0;
 
                     const angle = Math.atan2(dy, dx);
-                    
                     if (target.kit === 'bouncy') {
                         target.vx += Math.cos(angle) * (force * 0.2);
                         target.vy += Math.sin(angle) * (force * 0.2);
@@ -259,45 +242,32 @@ setInterval(() => {
                         target.y += Math.sin(angle) * force;
                     }
 
-                    // CONTACT DAMAGE
                     const hitDist = KITS.gravity.size + KITS[target.kit].size;
-                    
                     if (dist < hitDist) {
                         let damage = KITS.gravity.dmg;
-                        
-                        // GRAVITY VS GRAVITY: SINGULARITY DAMAGE
                         if (target.kit === 'gravity') {
-                            damage = 5; // Rapid tick damage (Mutual Destruction)
-                            // Also damage the source (p) because their fields are collapsing
-                            p.hp -= 2; 
-                            p.regenTimer = 300;
+                            damage = 5; p.hp -= 2; p.regenTimer = 300;
                         }
-
                         target.hp -= damage;
                         target.regenTimer = 300;
-
                         if (target.hp <= 0) {
                             io.emit('kill_feed', { killer: p.name, victim: target.name });
                             io.to(target.id).emit('you_died', { killer: p.name });
-                            p.score += (target.kit === 'gravity' ? 200 : 100); // Bonus for killing another gravity
+                            p.score += (target.kit === 'gravity' ? 200 : 100);
                             p.hp = Math.min(p.maxHp, p.hp + 50);
                             delete players[targetId];
                         }
                     }
                 }
             }
-
-            // Pull Bullets (Also scaled by distance)
             for (const b of bullets) {
                 if (b.ownerId === p.id) continue;
                 const dx = p.x - b.x;
                 const dy = p.y - b.y;
                 const dist = Math.sqrt(dx*dx + dy*dy);
-                
                 if (dist < range) {
                     const pullFactor = 1 - (dist / range);
                     const angle = Math.atan2(dy, dx);
-                    // Bullets get sucked in harder the closer they are
                     const strength = 0.5 + (pullFactor * 1.5); 
                     b.vx += Math.cos(angle) * strength;
                     b.vy += Math.sin(angle) * strength;
@@ -306,7 +276,7 @@ setInterval(() => {
         }
     }
 
-    // 2. STANDARD MOVEMENT LOOP
+    // 2. MOVEMENT & COLLISION
     for (const id in players) {
         const p = players[id];
         if(!p) continue; 
@@ -317,13 +287,66 @@ setInterval(() => {
         if (p.hp < p.maxHp && p.regenTimer <= 0) p.hp = Math.min(p.maxHp, p.hp + 0.15);
         if (p.regenTimer > 0) p.regenTimer--;
         
-        // --- Gravity Guy Self-Damage Check ---
-        // If they died from Singularity interaction in the previous loop
         if (p.hp <= 0 && p.kit === 'gravity') {
              io.emit('kill_feed', { killer: "The Singularity", victim: p.name });
              io.to(p.id).emit('you_died', { killer: "The Singularity" });
              delete players[id];
              continue;
+        }
+
+        // --- MIMIC EXPLOSION LOGIC ---
+        if (p.kit === 'mimic' && p.cooldown <= 0) {
+            for (const targetId in players) {
+                if (id === targetId) continue;
+                const target = players[targetId];
+                if (target.isInvincible) continue;
+
+                const dx = target.x - p.x;
+                const dy = target.y - p.y;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                
+                // Trigger distance: slightly larger than touching
+                if (dist < (stats.size + KITS[target.kit].size + 5)) {
+                    // EXPLODE
+                    p.cooldown = stats.reload; // ~1 sec cooldown
+                    
+                    // Damage Target
+                    target.hp -= stats.dmg;
+                    target.regenTimer = 300;
+                    
+                    // Knockback Target
+                    const angle = Math.atan2(dy, dx);
+                    // Add impulse velocity
+                    if (!target.vx) target.vx = 0; 
+                    if (!target.vy) target.vy = 0;
+                    target.vx += Math.cos(angle) * 15; 
+                    target.vy += Math.sin(angle) * 15;
+
+                    // Self Damage (Mimic takes some damage)
+                    p.hp -= 15;
+                    p.regenTimer = 300;
+
+                    // Visual Hit
+                    io.emit('hit', { x: p.x, y: p.y }); 
+
+                    // Kill Check
+                    if (target.hp <= 0) {
+                        io.emit('kill_feed', { killer: p.name, victim: target.name });
+                        io.to(target.id).emit('you_died', { killer: p.name });
+                        p.score += 200; // Big points for trap kill
+                        p.hp = Math.min(p.maxHp, p.hp + 50);
+                        delete players[targetId];
+                    }
+
+                    // Self Death Check
+                    if (p.hp <= 0) {
+                        io.emit('kill_feed', { killer: "Self Destruction", victim: p.name });
+                        io.to(p.id).emit('you_died', { killer: "Self Destruction" });
+                        delete players[id];
+                        continue; 
+                    }
+                }
+            }
         }
 
         // Movement Logic
@@ -362,7 +385,7 @@ setInterval(() => {
                         target.hp -= dmg;
                         target.regenTimer = 300;
                         io.emit('hit', { x: target.x, y: target.y });
-                        p.vx = -p.vx * 0.5; p.vy = -p.vy * 0.5; // Bounce
+                        p.vx = -p.vx * 0.5; p.vy = -p.vy * 0.5; 
                         
                         if (target.hp <= 0) {
                             io.emit('kill_feed', { killer: p.name, victim: target.name });
@@ -376,7 +399,6 @@ setInterval(() => {
             }
 
         } else {
-            // Standard Movement
             let speed = stats.speed;
             if (p.input.shift && p.stamina > 0) {
                 speed *= 1.4;
@@ -384,6 +406,10 @@ setInterval(() => {
             } else {
                 p.stamina = Math.min(100, p.stamina + 0.6);
             }
+            
+            // Apply Knockback Decay (for Mimic explosion recoil)
+            if (p.vx) { p.x += p.vx; p.vx *= 0.9; if(Math.abs(p.vx)<0.1) p.vx=0; }
+            if (p.vy) { p.y += p.vy; p.vy *= 0.9; if(Math.abs(p.vy)<0.1) p.vy=0; }
 
             let dx = 0, dy = 0;
             if (p.input.w) dy -= speed;
@@ -399,7 +425,7 @@ setInterval(() => {
         
         if (p.cooldown > 0) p.cooldown--;
 
-        // Orb Collision
+        // Orb Collision (Mimics can eat orbs too!)
         for (let i = orbs.length - 1; i >= 0; i--) {
             const orb = orbs[i];
             const dx = p.x - orb.x;
