@@ -12,7 +12,7 @@ app.use(express.static('public'));
 const FPS = 60;
 const MAP_SIZE = 1600; 
 const OBSTACLE_COUNT = 12; 
-const ORB_COUNT = 30; // Increased orb count slightly so mimics blend in better
+const ORB_COUNT = 30;
 
 const KITS = {
     assault: { name: "Assault", hp: 100, maxHp: 100, speed: 5, size: 22, reload: 10, dmg: 8,  bulletSpeed: 14, range: 450, spread: 0.1 },
@@ -21,9 +21,7 @@ const KITS = {
     shotgun: { name: "Shotgun", hp: 120, maxHp: 120, speed: 5, size: 24, reload: 40, dmg: 8,  bulletSpeed: 12, range: 300,  spread: 0.2, count: 5 },
     bouncy:  { name: "Bouncy Boi", hp: 150, maxHp: 150, speed: 0.8, size: 25, reload: 9999, dmg: 0, bulletSpeed: 0, range: 0, spread: 0 },
     gravity: { name: "Gravity Guy", hp: 250, maxHp: 250, speed: 3.0, size: 35, reload: 9999, dmg: 2, bulletSpeed: 0, range: 450, spread: 0 },
-    // MIMIC CLASS
     mimic:   { name: "Mimic", hp: 100, maxHp: 100, speed: 5.5, size: 12, reload: 60, dmg: 70, bulletSpeed: 0, range: 0, spread: 0 } 
-    // Size 12 matches Orb size roughly
 };
 
 let players = {};
@@ -54,6 +52,28 @@ function isColliding(p, r) {
         if (checkRectCollision({x: p.x, y: p.y, r: r}, obs)) return true;
     }
     return false;
+}
+
+// --- NEW: RAYCAST LINE OF SIGHT CHECK ---
+function hasLineOfSight(x1, y1, x2, y2) {
+    // Check 25 points along the line between the two positions
+    const steps = 25; 
+    const dx = (x2 - x1) / steps;
+    const dy = (y2 - y1) / steps;
+
+    for (let i = 1; i < steps; i++) {
+        const checkX = x1 + dx * i;
+        const checkY = y1 + dy * i;
+
+        // If this point is inside an obstacle, line of sight is blocked
+        for (const obs of obstacles) {
+            if (checkX > obs.x && checkX < obs.x + obs.w &&
+                checkY > obs.y && checkY < obs.y + obs.h) {
+                return false; 
+            }
+        }
+    }
+    return true;
 }
 
 // --- GENERATION ---
@@ -228,7 +248,8 @@ setInterval(() => {
                 const dy = p.y - target.y;
                 const dist = Math.sqrt(dx*dx + dy*dy);
 
-                if (dist < range) {
+                // ADDED: hasLineOfSight check
+                if (dist < range && hasLineOfSight(p.x, p.y, target.x, target.y)) {
                     const pullFactor = 1 - (dist / range);
                     let force = 0.5 + (pullFactor * 7.5);
                     if (target.kit === 'gravity') force *= 2.0;
@@ -260,12 +281,15 @@ setInterval(() => {
                     }
                 }
             }
+            // Apply logic to bullets too
             for (const b of bullets) {
                 if (b.ownerId === p.id) continue;
                 const dx = p.x - b.x;
                 const dy = p.y - b.y;
                 const dist = Math.sqrt(dx*dx + dy*dy);
-                if (dist < range) {
+                
+                // ADDED: hasLineOfSight check for bullets
+                if (dist < range && hasLineOfSight(p.x, p.y, b.x, b.y)) {
                     const pullFactor = 1 - (dist / range);
                     const angle = Math.atan2(dy, dx);
                     const strength = 0.5 + (pullFactor * 1.5); 
